@@ -11,6 +11,7 @@ A powerful Model Context Protocol (MCP) server that provides contextual database
    - [Integration with GitHub Copilot in VSCode Insiders](#integration-with-github-copilot-in-vscode-insiders)
       - [Option 1: Using Docker (Recommended)](#option-1-using-docker-recommended)
       - [Option 2: Using UV (Local Installation)](#option-2-using-uv-local-installation)
+   - [Integration with Trae](#integration-with-trae)
    - [Starting the Server locally](#starting-the-server-locally)
    - [Available Tools](#available-tools)
 - [Architecture](#architecture)
@@ -195,6 +196,68 @@ For both options:
 - The `TARGET_SCHEMA` is optional, it will default to the user's schema
 - The `CACHE_DIR` is optional, defaulting to `.cache` within the MCP server root folder
 - The `READ_ONLY_MODE` defaults to "1" (read-only) for security. Set to "0" only when write operations are needed
+
+### Integration with Trae
+
+Trae can connect to this server in two ways:
+
+#### Option 1: Streamable HTTP
+
+Run the server yourself and let Trae connect over HTTP. Useful when multiple clients should share the same database connection pool and schema cache.
+
+1. Configure the HTTP transport in your `.env` (default endpoint `http://127.0.0.1:8000/mcp`):
+
+   ```bash
+   MCP_TRANSPORT=streamable-http
+   MCP_HOST=127.0.0.1
+   MCP_PORT=8000
+   ```
+
+2. Start the server and keep it running:
+
+   ```bash
+   uv run main.py
+   ```
+
+3. In Trae, go to **Settings → MCP → Add → Manual configuration (Raw JSON)** and paste:
+
+   ```json
+   {
+     "mcpServers": {
+       "oracle": {
+         "url": "http://127.0.0.1:8000/mcp"
+       }
+     }
+   }
+   ```
+
+#### Option 2: stdio (Trae-managed process)
+
+Trae launches and manages the server process itself — no need to start anything manually:
+
+```json
+{
+  "mcpServers": {
+    "oracle": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/your/oracle-mcp-server",
+        "run",
+        "main.py"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
+
+- Replace `/path/to/your/oracle-mcp-server` with your actual project path (e.g. `d:\\agent_program\\oracle-mcp-server` on Windows)
+- `MCP_TRANSPORT=stdio` in `env` takes precedence over the `.env` file. It is **required** when your `.env` sets `MCP_TRANSPORT=streamable-http`; otherwise the process starts an HTTP listener and the stdio handshake never completes
+
+After adding the server, `oracle` should show as connected in Trae's MCP list, and all [Available Tools](#available-tools) become available to the AI assistant.
 
 ### Starting the Server locally
 

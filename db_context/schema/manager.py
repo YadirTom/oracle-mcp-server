@@ -1,9 +1,9 @@
 import json
 import time
 from pathlib import Path
-import sys
 from typing import Dict, List, Set, Optional, Any
 
+from ..core.log import logger
 from ..models import TableInfo, SchemaCache, SchemaManager as SchemaManagerProtocol
 
 class SchemaManager(SchemaManagerProtocol):
@@ -46,7 +46,7 @@ class SchemaManager(SchemaManagerProtocol):
         Detailed information will be loaded lazily when needed.
         """
         all_table_names = await self.db_connector.get_all_table_names()
-        print(f"Found {len(all_table_names)} tables in the database", file=sys.stderr)
+        logger.info(f"Found {len(all_table_names)} tables in the database")
         
         # Initialize empty table info for each table (lazy loading)
         schema_index = {
@@ -69,10 +69,10 @@ class SchemaManager(SchemaManagerProtocol):
 
         if not force_rebuild and self.cache_path.exists():
             try:
-                print(f"Opening existing index file for schema: {self.cache_path.stem}...", file=sys.stderr)
+                logger.info(f"Opening existing index file for schema: {self.cache_path.stem}...")
                 with open(self.cache_path, 'r') as f:
                     data = json.load(f)
-                    print("Loading index in memory...", file=sys.stderr)
+                    logger.info("Loading index in memory...")
                     # Load main schema cache
                     cache = SchemaCache(
                         tables={k: TableInfo(**{**v, 'table_name': k}) for k, v in data['tables'].items()},
@@ -88,13 +88,13 @@ class SchemaManager(SchemaManagerProtocol):
                     
                     return cache
             except (json.JSONDecodeError, KeyError) as e:
-                print(f"Error loading cache: {e}", file=sys.stderr)
+                logger.exception(f"Error loading cache: {e}")
                 # Fall through to rebuild
         
         # Build new cache
         tables = await self.build_schema_index()
         all_table_names = set(tables.keys())
-        print("Loading index in memory...", file=sys.stderr)
+        logger.info("Loading index in memory...")
         cache = SchemaCache(
             tables=tables, 
             last_updated=time.time(),
@@ -111,7 +111,7 @@ class SchemaManager(SchemaManagerProtocol):
         if not cache_to_save or not self.cache_path:
             return
             
-        print(f"Saving updated index to disk for schema: {self.cache_path.stem}...", file=sys.stderr)
+        logger.info(f"Saving updated index to disk for schema: {self.cache_path.stem}...")
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.cache_path, 'w') as f:
             json.dump({
@@ -121,7 +121,7 @@ class SchemaManager(SchemaManagerProtocol):
                 'object_cache': self.object_cache,
                 'cache_stats': self.cache_stats
             }, f, indent=2)
-        print("Index saved!", file=sys.stderr)
+        logger.info("Index saved!")
 
     async def get_schema_info(self, table_name: str) -> Optional[TableInfo]:
         """Get schema information for a specific table, loading it if necessary"""
@@ -144,7 +144,7 @@ class SchemaManager(SchemaManagerProtocol):
             
         # If the table isn't fully loaded, load it now
         if not self.cache.tables[table_name].fully_loaded:
-            print(f"Lazily loading details for table {table_name}...", file=sys.stderr)
+            logger.debug(f"Lazily loading details for table {table_name}...")
             table_details = await self.db_connector.load_table_details(table_name)
             if table_details:
                 table_info = TableInfo(
@@ -196,7 +196,7 @@ class SchemaManager(SchemaManagerProtocol):
                     await self.save_cache()
                     
             except Exception as e:
-                print(f"Error during database table search: {str(e)}", file=sys.stderr)
+                logger.exception(f"Error during database table search: {str(e)}")
         
         # Return the first 'limit' matching tables
         return matching_tables[:limit]
@@ -247,7 +247,7 @@ class SchemaManager(SchemaManagerProtocol):
                                 await self.save_cache()
                                 
                 except Exception as e:
-                    print(f"Error during database column search: {str(e)}", file=sys.stderr)
+                    logger.exception(f"Error during database column search: {str(e)}")
         
         return dict(list(result.items())[:limit])
 

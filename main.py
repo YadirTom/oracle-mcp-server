@@ -1,10 +1,9 @@
 from mcp.server.fastmcp import FastMCP, Context
 import json
 import os
-import sys
-from typing import Dict, List, AsyncIterator, Optional
+from typing import Dict, List, Optional
 import time
-from contextlib import asynccontextmanager
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 import uuid  # retained for potential future use elsewhere
@@ -13,6 +12,7 @@ import oracledb
 from db_context import DatabaseContext
 from db_context.utils import wrap_untrusted
 from db_context.schema.formatter import format_sql_query_result
+from db_context.core.log import logger
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,18 +23,32 @@ CACHE_DIR = os.getenv('CACHE_DIR', '.cache')
 USE_THICK_MODE = os.getenv('THICK_MODE', '').lower() in ('true', '1', 'yes')  # Convert string to boolean
 READ_ONLY_MODE = os.getenv('READ_ONLY_MODE', 'true').lower() not in ('false', '0', 'no')
 ORACLE_CLIENT_LIB_DIR = os.getenv('ORACLE_CLIENT_LIB_DIR', None)
+MCP_TRANSPORT = os.getenv('MCP_TRANSPORT', 'stdio').lower()
+MCP_HOST = os.getenv('MCP_HOST', '127.0.0.1')
+MCP_PORT = int(os.getenv('MCP_PORT', '8000'))
 
-@asynccontextmanager
-async def app_lifespan(server: FastMCP) -> AsyncIterator[DatabaseContext]:
-    """Manage application lifecycle and ensure DatabaseContext is properly initialized"""
-    print("App Lifespan initialising", file=sys.stderr)
+# Shared DatabaseContext, initialized once at startup (before serving any transport)
+# and reused by all MCP sessions. In streamable-http mode the FastMCP lifespan runs
+# per-session, so we deliberately do NOT use it — otherwise every client session
+# would create its own connection pool.
+_db_context: Optional[DatabaseContext] = None
+
+def get_db() -> DatabaseContext:
+    """Return the shared, already-initialized DatabaseContext."""
+    if _db_context is None:
+        raise RuntimeError("DatabaseContext is not initialized yet.")
+    return _db_context
+
+async def init_db_context() -> DatabaseContext:
+    """Create and initialize the shared DatabaseContext (pool + schema cache)."""
+    logger.info("App Lifespan initialising")
     connection_string = ORACLE_CONNECTION_STRING
     if not connection_string:
         raise ValueError("ORACLE_CONNECTION_STRING environment variable is required. Set it in .env file or environment.")
-    
+
     cache_dir = Path(CACHE_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    
+
     db_context = DatabaseContext(
         connection_string=connection_string,
         cache_path=cache_dir / 'schema_cache.json',
@@ -43,22 +57,16 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[DatabaseContext]:
         lib_dir=ORACLE_CLIENT_LIB_DIR,
         read_only=READ_ONLY_MODE
     )
-    
-    try:
-        # Initialize cache on startup
-        print("Initialising database cache...", file=sys.stderr)
-        await db_context.initialize()
-        print("Cache ready!", file=sys.stderr)
-        yield db_context
-    finally:
-        # Ensure proper cleanup of database resources
-        print("Closing database connections...", file=sys.stderr)
-        await db_context.close()
-        print("Database connections closed", file=sys.stderr)
+
+    # Initialize cache on startup
+    logger.info("Initialising database cache...")
+    await db_context.initialize()
+    logger.info("Cache ready!")
+    return db_context
 
 # Initialize FastMCP server
-mcp = FastMCP("oracle", lifespan=app_lifespan)
-print("FastMCP server initialized", file=sys.stderr)
+mcp = FastMCP("oracle", host=MCP_HOST, port=MCP_PORT)
+logger.info("FastMCP server initialized")
 
 @mcp.tool()
 async def get_table_schema(table_name: str, ctx: Context) -> str:
@@ -71,7 +79,7 @@ async def get_table_schema(table_name: str, ctx: Context) -> str:
     Args:
         table_name: Exact table name (case-insensitive).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     table_info = await db_context.get_schema_info(table_name)
     
     if not table_info:
@@ -88,7 +96,7 @@ async def rebuild_schema_cache(ctx: Context) -> str:
     Compose: Run once before bulk analytics if structure changed.
     Avoid: Inside loops or routine per-request flows.
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     try:
         await db_context.rebuild_cache()
         cache_size = len(db_context.schema_manager.cache.all_table_names) if db_context.schema_manager.cache else 0
@@ -104,7 +112,7 @@ async def get_tables_schema(table_names: List[str], ctx: Context) -> str:
     Compose: Combine results with constraints / indexes per table if deeper profiling needed.
     Avoid: Broad discovery (use search_tables_schema first).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     results = []
     
     for table_name in table_names:
@@ -126,7 +134,7 @@ async def search_tables_schema(search_term: str, ctx: Context) -> str:
     Compose: Feed resulting names into deeper profiling (constraints/indexes/dependents).
     Avoid: Acting as a full table list (results capped at 20; filtered).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     # Split search term by commas and whitespace and remove empty strings
     search_terms = [term.strip() for term in search_term.replace(',', ' ').split()]
@@ -177,7 +185,7 @@ async def get_database_vendor_info(ctx: Context) -> str:
     Compose: Call once early; reuse info client-side.
     Avoid: Polling repeatedly (metadata rarely changes per session).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         db_info = await db_context.get_database_info()
@@ -210,7 +218,7 @@ async def search_columns(search_term: str, ctx: Context) -> str:
     Compose: Narrow candidate tables before calling per-table tools.
     Avoid: Full structural profiling (use get_table_schema + constraints instead).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         matching_columns = await db_context.search_columns(search_term, limit=50)
@@ -239,7 +247,7 @@ async def get_pl_sql_objects(object_type: str, name_pattern: Optional[str], ctx:
     Compose: Follow with get_object_source or get_dependent_objects.
     Avoid: Counting table dependencies (use get_dependent_objects on the table).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         objects = await db_context.get_pl_sql_objects(object_type.upper(), name_pattern)
@@ -273,7 +281,7 @@ async def get_object_source(object_type: str, object_name: str, ctx: Context) ->
     Compose: Pair with dependency info for refactor planning.
     Avoid: Bulk enumeration (fetch only what you need).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         source = await db_context.get_object_source(object_type.upper(), object_name.upper())
@@ -293,7 +301,7 @@ async def get_table_constraints(table_name: str, ctx: Context) -> str:
     Compose: With get_related_tables (quick FK direction) + get_table_indexes.
     Avoid: Manually parsing schema text for constraints elsewhere.
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         constraints = await db_context.get_table_constraints(table_name)
@@ -331,7 +339,7 @@ async def get_table_indexes(table_name: str, ctx: Context) -> str:
     Compose: With get_table_constraints (PK/UK) + get_dependent_objects.
     Avoid: Calling just to re-learn column order (columns via get_table_schema).
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         indexes = await db_context.get_table_indexes(table_name)
@@ -364,7 +372,7 @@ async def get_dependent_objects(object_name: str, ctx: Context) -> str:
     Compose: Combine counts with FK + index metrics for ranking.
     Avoid: Running on every table blindly—filter candidates first.
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         dependencies = await db_context.get_dependent_objects(object_name.upper())
@@ -391,7 +399,7 @@ async def get_user_defined_types(type_pattern: Optional[str], ctx: Context) -> s
     Compose: Only include in importance scoring if type coupling matters.
     Avoid: Treating as a substitute for table relationship analysis.
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         types = await db_context.get_user_defined_types(type_pattern)
@@ -424,7 +432,7 @@ async def get_related_tables(table_name: str, ctx: Context) -> str:
     Compose: With get_table_constraints (details) + get_dependent_objects (broader usage).
     Avoid: Deriving FK direction manually from constraints output.
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         related = await db_context.get_related_tables(table_name)
@@ -457,7 +465,7 @@ async def run_sql_query(sql: str, ctx: Context, max_rows: int = 100) -> str:
     Compose: Supplement structured metadata tools (e.g. row counts) sparingly.
     Avoid: Rebuilding metadata graphs already available via dedicated tools.
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     
     try:
         result = await db_context.run_sql_query(sql, max_rows=max_rows)
@@ -486,7 +494,7 @@ async def explain_query_plan(sql: str, ctx: Context) -> str:
     Use: Pre-flight cost / access path inspection before running large queries.
     Avoid: High frequency calls in loops.
     """
-    db_context: DatabaseContext = ctx.request_context.lifespan_context
+    db_context = get_db()
     try:
         plan = await db_context.explain_query_plan(sql)
         # Standardize error wrapping
@@ -507,5 +515,30 @@ async def explain_query_plan(sql: str, ctx: Context) -> str:
     except Exception as e:
         return wrap_untrusted(f"Unexpected error obtaining plan: {e}")
 
+async def _run() -> None:
+    """Initialize the shared DB context first, then serve the selected transport.
+
+    Everything runs in a single event loop so the async connection pool is
+    created and used on the same loop.
+    """
+    global _db_context
+    _db_context = await init_db_context()
+    try:
+        if MCP_TRANSPORT == "stdio":
+            await mcp.run_stdio_async()
+        elif MCP_TRANSPORT == "sse":
+            await mcp.run_sse_async()
+        else:
+            await mcp.run_streamable_http_async()
+    finally:
+        # Ensure proper cleanup of database resources
+        logger.info("Closing database connections...")
+        await _db_context.close()
+        logger.info("Database connections closed")
+
 if __name__ == "__main__":
-    mcp.run()
+    if MCP_TRANSPORT not in ("stdio", "sse", "streamable-http"):
+        raise ValueError(f"Unsupported MCP_TRANSPORT: '{MCP_TRANSPORT}'. Use stdio, sse, or streamable-http.")
+    if MCP_TRANSPORT == "streamable-http":
+        logger.info(f"Starting streamable-http server at http://{MCP_HOST}:{MCP_PORT}/mcp")
+    asyncio.run(_run())

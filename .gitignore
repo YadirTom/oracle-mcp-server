@@ -30,3 +30,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+/.idea
+/.trae

@@ -11,6 +11,7 @@
    - [在 VSCode Insiders 中集成 GitHub Copilot](#在-vscode-insiders-中集成-github-copilot)
       - [选项 1：使用 Docker（推荐）](#选项-1使用-docker推荐)
       - [选项 2：使用 UV（本地安装）](#选项-2使用-uv本地安装)
+   - [集成到 Trae](#集成到-trae)
    - [本地启动服务器](#本地启动服务器)
    - [可用工具](#可用工具)
 - [架构](#架构)
@@ -191,6 +192,68 @@ MCP Oracle DB Context 服务器解决了在处理超大型 Oracle 数据库时�
 - 将 `ORACLE_CONNECTION_STRING` 替换为实际的数据库连接字符串
 - `TARGET_SCHEMA` 可选，默认为当前用户的 schema
 - `CACHE_DIR` 可选，默认为 MCP 服务器根目录下的 `.cache`
+
+### 集成到 Trae
+
+Trae 可以通过两种方式接入本服务器：
+
+#### 选项 1：Streamable HTTP
+
+由你自己启动并保持服务运行，Trae 通过 HTTP 连接。适合多个客户端共享同一个数据库连接池和 schema 缓存的场景。
+
+1. 在 `.env` 中配置 HTTP 传输（默认端点 `http://127.0.0.1:8000/mcp`）：
+
+   ```bash
+   MCP_TRANSPORT=streamable-http
+   MCP_HOST=127.0.0.1
+   MCP_PORT=8000
+   ```
+
+2. 启动服务并保持运行：
+
+   ```bash
+   uv run main.py
+   ```
+
+3. 在 Trae 中进入 **设置 → MCP → 添加 → 手动配置（Raw JSON）**，粘贴：
+
+   ```json
+   {
+     "mcpServers": {
+       "oracle": {
+         "url": "http://127.0.0.1:8000/mcp"
+       }
+     }
+   }
+   ```
+
+#### 选项 2：stdio（Trae 托管进程）
+
+由 Trae 自动拉起和管理服务器进程，无需手动启动：
+
+```json
+{
+  "mcpServers": {
+    "oracle": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/your/oracle-mcp-server",
+        "run",
+        "main.py"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
+
+- 将 `/path/to/your/oracle-mcp-server` 替换为实际项目路径（Windows 下如 `d:\\agent_program\\oracle-mcp-server`）
+- `env` 中的 `MCP_TRANSPORT=stdio` 优先级高于 `.env` 文件。当你的 `.env` 配置了 `MCP_TRANSPORT=streamable-http` 时**必须**显式覆盖，否则进程会启动 HTTP 监听，stdio 握手永远无法完成
+
+添加完成后，Trae 的 MCP 列表中 `oracle` 显示为已连接，所有[可用工具](#可用工具)即可被 AI 助手调用。
 
 ### 本地启动服务器
 

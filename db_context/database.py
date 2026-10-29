@@ -1,11 +1,10 @@
-import sys
 import oracledb
 import sqlparse
 import time
 import asyncio
 from typing import Dict, List, Set, Optional, Any
 from pathlib import Path
-from .models import SchemaManager
+from .core.log import logger
 
 class DatabaseConnector:
     def __init__(self, connection_string: str, target_schema: Optional[str] = None, use_thick_mode: bool = False, lib_dir: Optional[str] = None, read_only: bool = True):
@@ -19,7 +18,6 @@ class DatabaseConnector:
             read_only: When True (default) all write operations will be blocked.
         """
         self.connection_string = connection_string
-        self.schema_manager: Optional[SchemaManager] = None  # Will be set by DatabaseContext
         self.target_schema: Optional[str] = target_schema
         self.thick_mode = use_thick_mode
         self.read_only = read_only
@@ -32,10 +30,10 @@ class DatabaseConnector:
                     oracledb.init_oracle_client(lib_dir=lib_dir)
                 else:
                     oracledb.init_oracle_client()
-                print("Oracle Client initialized in thick mode", file=sys.stderr)
+                logger.info("Oracle Client initialized in thick mode")
             except Exception as e:
-                print(f"Warning: Could not initialize Oracle Client: {e}", file=sys.stderr)
-                print("Falling back to thin mode", file=sys.stderr)
+                logger.warning(f"Could not initialize Oracle Client: {e}")
+                logger.warning("Falling back to thin mode")
                 self.thick_mode = False
 
     async def initialize_pool(self):
@@ -59,9 +57,9 @@ class DatabaseConnector:
                             increment=1,
                             getmode=oracledb.POOL_GETMODE_WAIT
                         )
-                    print("Database connection pool initialized", file=sys.stderr)
+                    logger.info("Database connection pool initialized")
                 except Exception as e:
-                    print(f"Error creating connection pool: {e}", file=sys.stderr)
+                    logger.exception(f"Error creating connection pool: {e}")
                     raise
 
     async def get_connection(self):
@@ -75,7 +73,7 @@ class DatabaseConnector:
             else:
                 return await self._pool.acquire()
         except Exception as e:
-            print(f"Error acquiring connection from pool: {e}", file=sys.stderr)
+            logger.exception(f"Error acquiring connection from pool: {e}")
             raise
 
     async def _close_connection(self, conn):
@@ -86,7 +84,7 @@ class DatabaseConnector:
             else:
                 await self._pool.release(conn)
         except Exception as e:
-            print(f"Error releasing connection to pool: {e}", file=sys.stderr)
+            logger.exception(f"Error releasing connection to pool: {e}")
 
     async def close_pool(self):
         """Close the connection pool"""
@@ -97,13 +95,9 @@ class DatabaseConnector:
                 else:
                     await self._pool.close()
                 self._pool = None
-                print("Connection pool closed", file=sys.stderr)
+                logger.info("Connection pool closed")
             except Exception as e:
-                print(f"Error closing connection pool: {e}", file=sys.stderr)
-
-    def set_schema_manager(self, schema_manager: SchemaManager) -> None:
-        """Set the schema manager reference"""
-        self.schema_manager = schema_manager
+                logger.exception(f"Error closing connection pool: {e}")
 
     async def _execute_cursor_fetch(self, cursor, sql: str, max_rows: Optional[int] = None, **params):
         """Helper method to execute cursor operations and fetch results.
@@ -117,6 +111,7 @@ class DatabaseConnector:
         Returns:
             List of rows from the query result
         """
+        logger.debug("SQL(fetch): {} | params: {}", sql, params)
         if self.thick_mode:
             cursor.execute(sql, **params)
             if max_rows is None:
@@ -144,6 +139,7 @@ class DatabaseConnector:
     async def _execute_cursor_no_fetch(self, cursor, sql: str, **params):
         """Helper method for statements that modify data (e.g. DELETE, UPDATE)."""
         self._assert_query_executable(sql)
+        logger.debug("SQL(no-fetch): {} | params: {}", sql, params)
         if self.thick_mode:
             cursor.execute(sql, **params)
         else:
@@ -197,7 +193,7 @@ class DatabaseConnector:
                     
             return vendor_info
         except oracledb.Error as e:
-            print(f"Error getting database info: {str(e)}", file=sys.stderr)
+            logger.exception(f"Error getting database info: {str(e)}")
             return {"vendor": "Oracle", "version": "Unknown", "error": str(e)}
         finally:
             await self._close_connection(conn)
@@ -206,7 +202,7 @@ class DatabaseConnector:
         """Get a list of all table names in the database using optimized query"""
         conn = await self.get_connection()
         try:
-            print("Getting list of all tables...", file=sys.stderr)
+            logger.info("Getting list of all tables...")
             cursor = conn.cursor()
             schema = await self._get_effective_schema(conn)
             # Using RESULT_CACHE hint for frequently accessed data
@@ -329,7 +325,7 @@ class DatabaseConnector:
             }
             
         except oracledb.Error as e:
-            print(f"Error loading table details for {table_name}: {str(e)}", file=sys.stderr)
+            logger.exception(f"Error loading table details for {table_name}: {str(e)}")
             raise
         finally:
             await self._close_connection(conn)
@@ -420,7 +416,7 @@ class DatabaseConnector:
                 return await clob.read()
                 
         except oracledb.Error as e:
-            print(f"Error getting object source: {str(e)}", file=sys.stderr)
+            logger.exception(f"Error getting object source: {str(e)}")
             return f"Error retrieving source: {str(e)}"
         finally:
             await self._close_connection(conn)
@@ -585,7 +581,7 @@ class DatabaseConnector:
             
             return result
         except oracledb.Error as e:
-            print(f"Error getting dependent objects: {str(e)}", file=sys.stderr)
+            logger.exception(f"Error getting dependent objects: {str(e)}")
             raise
         finally:
             await self._close_connection(conn)
@@ -874,7 +870,7 @@ class DatabaseConnector:
                 "optimization_suggestions": basic_analysis
             }
         except oracledb.Error as e:
-            print(f"Error explaining query: {str(e)}", file=sys.stderr)
+            logger.exception(f"Error explaining query: {str(e)}")
             return {
                 "execution_plan": [],
                 "optimization_suggestions": ["Unable to generate execution plan due to error."],

@@ -10,8 +10,6 @@ class DatabaseContext:
     def __init__(self, connection_string: str, cache_path: Path, target_schema: Optional[str] = None,  use_thick_mode: bool = False, lib_dir: Optional[str] = None, read_only: bool = True):
         self.db_connector = DatabaseConnector(connection_string, target_schema, use_thick_mode, lib_dir, read_only)
         self.schema_manager = SchemaManager(self.db_connector, cache_path)
-        # Set the schema manager reference in the connector
-        self.db_connector.set_schema_manager(self.schema_manager)
         
     async def initialize(self) -> None:
         """Initialize the database context, connection pool, and schema cache"""
